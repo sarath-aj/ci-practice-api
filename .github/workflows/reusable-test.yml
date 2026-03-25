@@ -67,14 +67,16 @@ jobs:
           POSTGRES_DB: ci_practice
         ports:
           - 5432:5432                      # Map container port → runner port
+
+        # ↑ GitHub Actions waits until postgres is READY before starting steps.
+        # Without this, the DB might not be accepting connections yet when
+        # our integration tests try to connect — causing flaky test failures.
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-          # ↑ GitHub Actions waits until postgres is READY before starting steps.
-          # Without this, the DB might not be accepting connections yet when
-          # our integration tests try to connect — causing flaky test failures.
+
 
     steps:
       # ── Step 1: Checkout ────────────────────────────────────────────────────
