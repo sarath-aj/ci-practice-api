@@ -1,0 +1,164 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# reusable-test.yml — Reusable Workflow: Run Tests
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# WHY A REUSABLE WORKFLOW?
+# The test logic (install → lint → unit test → integration test) is the same
+# whether it's triggered by a push, a PR, or called manually. Instead of
+# copy-pasting it, we extract it here and call it from ci.yml.
+# This follows the DRY principle — change tests once, applies everywhere.
+#
+# HOW TO CALL THIS:
+#   jobs:
+#     run-tests:
+#       uses: ./.github/workflows/reusable-test.yml
+#       with:
+#         node-version: "20"
+#       secrets:
+#         db-password: ${{ secrets.DB_PASSWORD }}
+
+name: Reusable - Run Tests
+
+on:
+  workflow_call:
+    # ── Inputs ────────────────────────────────────────────────────────────────
+    # Callers pass these in. This makes the workflow configurable — the matrix
+    # in ci.yml can call this once per Node version.
+    inputs:
+      node-version:
+        description: "Node.js version to test against"
+        required: true
+        type: string
+
+    # ── Secrets ───────────────────────────────────────────────────────────────
+    # Secrets cannot be inherited automatically — they must be explicitly
+    # declared and passed through. This is a security boundary in GitHub Actions.
+    secrets:
+      db-password:
+        description: "PostgreSQL password"
+        required: true
+
+    # ── Outputs ───────────────────────────────────────────────────────────────
+    # The caller (ci.yml) can read these values from this workflow's jobs.
+    outputs:
+      coverage-pct:
+        description: "Line coverage percentage"
+        value: ${{ jobs.test.outputs.coverage-pct }}
+
+jobs:
+  test:
+    name: Test (Node ${{ inputs.node-version }})
+    runs-on: ubuntu-latest
+
+    # ── Outputs from this specific job ────────────────────────────────────────
+    outputs:
+      coverage-pct: ${{ steps.coverage.outputs.pct }}
+
+    # ── Service Containers ────────────────────────────────────────────────────
+    # GitHub spins up this Docker container BEFORE any steps run.
+    # It lives in the same network as the job runner, accessible by hostname.
+    # This is how we get a real PostgreSQL for integration tests in CI.
+    services:
+      postgres:
+        image: postgres:16-alpine          # Pinned version — avoid surprise breakage
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ${{ secrets.db-password }}
+          POSTGRES_DB: ci_practice
+        ports:
+          - 5432:5432                      # Map container port → runner port
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          # ↑ GitHub Actions waits until postgres is READY before starting steps.
+          # Without this, the DB might not be accepting connections yet when
+          # our integration tests try to connect — causing flaky test failures.
+
+    steps:
+      # ── Step 1: Checkout ────────────────────────────────────────────────────
+      # Without this, the runner has NO code. Always the first step.
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Step 2: Setup Node ──────────────────────────────────────────────────
+      # Uses the node-version INPUT so the matrix can vary it.
+      # cache: 'npm' tells this action to cache ~/.npm between runs.
+      - name: Setup Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: "npm"
+          # ↑ This caches the npm cache directory. Combined with our
+          # explicit cache step below, installs go from ~30s to ~3s.
+
+      # ── Step 3: Cache node_modules ──────────────────────────────────────────
+      # actions/setup-node caches the npm CACHE (~/.npm).
+      # This step caches node_modules itself — even faster.
+      # Cache key includes the OS + lockfile hash.
+      # If package-lock.json changes, the cache is invalidated automatically.
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ inputs.node-version }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ inputs.node-version }}-
+            ${{ runner.os }}-node-
+
+      # ── Step 4: Install dependencies ────────────────────────────────────────
+      # `npm ci` is used instead of `npm install` in CI because:
+      # - It uses package-lock.json exactly (reproducible)
+      # - It errors on lockfile mismatch (catches drift)
+      # - It's faster (no dependency resolution)
+      - name: Install dependencies
+        run: npm ci
+
+      # ── Step 5: Lint ────────────────────────────────────────────────────────
+      # Run BEFORE tests — fail fast on code quality issues.
+      # Linting is cheap; don't waste compute running tests on broken code.
+      - name: Run ESLint
+        run: npm run lint
+
+      # ── Step 6: Unit Tests ──────────────────────────────────────────────────
+      # Mocked DB — no service container needed.
+      # Fast: should complete in <10s.
+      - name: Run unit tests
+        run: npm run test:unit
+
+      # ── Step 7: Integration Tests ───────────────────────────────────────────
+      # Hits the REAL PostgreSQL service container.
+      # Env vars tell our app (src/db.js) where to connect.
+      - name: Run integration tests
+        run: npm run test:integration
+        env:
+          DB_HOST: localhost          # The service container is mapped to localhost
+          DB_PORT: 5432
+          DB_NAME: ci_practice
+          DB_USER: postgres
+          DB_PASSWORD: ${{ secrets.db-password }}
+          NODE_ENV: test
+
+      # ── Step 8: Extract coverage percentage ─────────────────────────────────
+      # Parse the Jest coverage output to get the line % as a job output.
+      # We'll use this in ci.yml to display/gate on coverage.
+      - name: Extract coverage percentage
+        id: coverage
+        run: |
+          # Jest writes a summary line like: "Lines     : 85.71% ( 12/14 )"
+          # We grep + awk to extract just the number.
+          PCT=$(npx jest --coverage --coverageReporters=text 2>/dev/null | grep "Lines" | awk '{print $3}' | tr -d '%' || echo "0")
+          echo "pct=${PCT}" >> $GITHUB_OUTPUT
+          echo "Coverage: ${PCT}%"
+
+      # ── Step 9: Upload coverage artifact ────────────────────────────────────
+      # The HTML coverage report is saved and available for 7 days in the
+      # Actions UI under "Artifacts". Team members can download and view it.
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()              # Upload even if tests failed — helps debugging
+        with:
+          name: coverage-report-node-${{ inputs.node-version }}
+          path: coverage/
+          retention-days: 7

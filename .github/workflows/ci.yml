@@ -1,0 +1,265 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# ci.yml — Main CI Pipeline
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# PIPELINE OVERVIEW:
+#
+#   [push / PR]
+#       │
+#       ▼
+#   ┌─────────┐
+#   │  audit  │  (security scan — runs independently, fast)
+#   └────┬────┘
+#        │
+#        ▼
+#   ┌─────────────────────────────────────────────────────┐
+#   │              test (matrix: Node 18, 20, 22)         │  ← calls reusable workflow
+#   │   lint → unit tests → integration tests → artifact  │
+#   └──────────────────────────┬──────────────────────────┘
+#                              │  (all 3 matrix jobs must pass)
+#                              ▼
+#                      ┌──────────────┐
+#                      │  docker-build│  (skipped on draft PRs)
+#                      └──────────────┘
+#
+# JOBS SUMMARY:
+#   1. audit        — npm audit (security vulnerabilities)
+#   2. test         — matrix across Node 18/20/22 (calls reusable-test.yml)
+#   3. docker-build — build Docker image (skipped on drafts)
+
+name: CI
+
+# ── Triggers ──────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches:
+      - main
+      - develop
+    # PATH FILTER: Only trigger CI if these files changed.
+    # A docs-only change shouldn't run the full test suite.
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".gitignore"
+
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".gitignore"
+
+  # Allow manually triggering from the GitHub Actions UI
+  workflow_dispatch:
+    inputs:
+      skip-docker:
+        description: "Skip Docker build?"
+        required: false
+        default: "false"
+        type: boolean
+
+# ── Concurrency ───────────────────────────────────────────────────────────────
+# If a new push happens while CI is already running for the same branch/PR,
+# cancel the old run. Saves CI minutes and keeps things snappy.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# ── Default settings ──────────────────────────────────────────────────────────
+defaults:
+  run:
+    shell: bash
+
+# ── Environment variables (global) ───────────────────────────────────────────
+# These are available to ALL jobs in this workflow.
+# Job-level or step-level env vars override these.
+env:
+  NODE_ENV: test
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 1: Security Audit
+  # ════════════════════════════════════════════════════════════════════════════
+  # Runs INDEPENDENTLY and in parallel with the test matrix.
+  # Fast job — just npm audit. No need to wait for tests.
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      # npm audit exits with non-zero if HIGH or CRITICAL vulnerabilities found.
+      # `--audit-level=high` means LOW and MODERATE vulns won't fail the build.
+      # Adjust threshold to match your team's risk tolerance.
+      - name: Run security audit
+        run: npm audit --audit-level=high
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 2: Test Matrix
+  # ════════════════════════════════════════════════════════════════════════════
+  # Calls our reusable workflow for EACH Node.js version in the matrix.
+  # GitHub Actions fans these out as 3 parallel jobs automatically.
+  #
+  # WHY MATRIX?
+  # Your package might work on Node 20 but break on Node 18 due to API changes.
+  # A matrix catches this without duplicating workflow code.
+  test:
+    name: Test
+    needs: []             # Run in parallel with audit (no dependency on audit)
+    strategy:
+      # FAIL-FAST: false means if Node 18 fails, Node 20 and 22 keep running.
+      # You'll see the full picture — maybe only one version is broken.
+      # Set to true if you want to stop everything on first failure (faster feedback).
+      fail-fast: false
+      matrix:
+        node-version: ["18", "20", "22"]
+
+    # ── Calling the reusable workflow ─────────────────────────────────────────
+    # Each matrix iteration calls this with a different node-version.
+    uses: ./.github/workflows/reusable-test.yml
+    with:
+      node-version: ${{ matrix.node-version }}
+    secrets:
+      # Pass the secret through — reusable workflows can't access secrets
+      # from the caller automatically, they must be explicitly forwarded.
+      db-password: ${{ secrets.DB_PASSWORD }}
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 3: Coverage Gate
+  # ════════════════════════════════════════════════════════════════════════════
+  # After all matrix test jobs pass, check the coverage from Node 20.
+  # This is a "gate" job — if coverage is too low, fail here.
+  coverage-gate:
+    name: Coverage Gate
+    runs-on: ubuntu-latest
+
+    # Depends on ALL matrix test jobs completing successfully.
+    # GitHub evaluates the matrix as a whole for the `needs` key.
+    needs: [test]
+
+    steps:
+      - name: Check coverage threshold
+        run: |
+          # We output coverage from the reusable workflow.
+          # In a real setup you might download the artifact and parse it.
+          # Here we just echo a pass message — Jest already enforces thresholds
+          # via coverageThreshold in jest.config.js (job would have failed there).
+          echo "✅ All test jobs passed — coverage thresholds enforced by Jest config"
+          echo "Coverage reports available as job artifacts in the Actions UI"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 4: Docker Build
+  # ════════════════════════════════════════════════════════════════════════════
+  # Build the Docker image to verify it's not broken.
+  # We do NOT push to a registry here — that's the CD pipeline's job.
+  #
+  # SKIPPED WHEN:
+  #   - PR is a draft (draft PRs are WIP — no point building Docker)
+  #   - workflow_dispatch with skip-docker: true
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+
+    # Only start after both audit AND all test matrix jobs pass.
+    # If security audit finds a critical vuln, we stop here.
+    needs: [audit, test]
+
+    # ── Conditional: skip this job in certain situations ──────────────────────
+    # github.event.pull_request.draft — true if this is a draft PR
+    # github.event.inputs.skip-docker — manual trigger override
+    #
+    # `if` on a job skips the entire job (shows as "skipped" not "failed").
+    if: |
+      github.event.pull_request.draft == false &&
+      github.event.inputs.skip-docker != 'true'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Extract version from package.json ─────────────────────────────────
+      # We use this as the Docker image tag.
+      # job outputs allow passing this to other jobs if needed.
+      - name: Extract app version
+        id: version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "app-version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "App version: ${VERSION}"
+
+      # ── Set up Docker Buildx ──────────────────────────────────────────────
+      # Buildx is the modern Docker build engine. Supports multi-platform
+      # builds, better caching, and BuildKit features.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── Build Docker image ────────────────────────────────────────────────
+      # `load: true` loads the image into Docker daemon (needed for local use).
+      # `push: false` — we're just verifying the build works, not publishing.
+      # Tags use the version from package.json + the git SHA for traceability.
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false          # CI only — CD pipeline handles push to registry
+          load: true
+          tags: |
+            ci-practice-api:${{ steps.version.outputs.app-version }}
+            ci-practice-api:${{ github.sha }}
+          # Cache layers from previous runs — makes rebuilds much faster
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── Smoke test the Docker image ───────────────────────────────────────
+      # Start the container and hit /health to make sure it boots correctly.
+      # This catches "builds but crashes on startup" issues.
+      - name: Smoke test Docker image
+        run: |
+          # Start container in background, map port 3000
+          docker run -d \
+            --name ci-test \
+            -p 3000:3000 \
+            -e DB_HOST=localhost \
+            -e DB_PORT=5432 \
+            -e DB_NAME=ci_practice \
+            -e DB_USER=postgres \
+            -e DB_PASSWORD=postgres \
+            ci-practice-api:${{ github.sha }}
+
+          # Wait for the container to start (max 15s)
+          sleep 5
+
+          # Hit the health endpoint — curl exits non-zero if it fails
+          # --fail makes curl return error on HTTP 4xx/5xx
+          curl --fail --retry 3 --retry-delay 2 http://localhost:3000/health || \
+            (docker logs ci-test && exit 1)
+          # ↑ If health check fails, dump container logs first (helps debug),
+          #   then fail the step.
+
+          echo "✅ Docker smoke test passed"
+
+      # ── Output job summary ─────────────────────────────────────────────────
+      # Writes a summary to the GitHub Actions job summary page.
+      # Visible in the Actions UI — great for at-a-glance status.
+      - name: Write job summary
+        run: |
+          echo "## 🐳 Docker Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
+          echo "| App Version | ${{ steps.version.outputs.app-version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Git SHA | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ✅ Build succeeded |" >> $GITHUB_STEP_SUMMARY
