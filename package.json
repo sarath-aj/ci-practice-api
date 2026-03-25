@@ -4,8 +4,8 @@
   "description": "Mock REST API for GitHub Actions CI practice",
   "main": "src/app.js",
   "scripts": {
-    "start": "node src/app.js",
-    "dev": "nodemon src/app.js",
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
     "lint": "eslint src/ tests/",
     "test:unit": "jest tests/unit --coverage",
     "test:integration": "jest tests/integration --runInBand",
